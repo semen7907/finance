@@ -1,4 +1,6 @@
 import sqlite3
+import traceback
+
 import telebot
 from telebot import types
 import re
@@ -1157,6 +1159,223 @@ def get_user_transactions(user_id):
     return df
 
 
+def calculate_days_until_salary(current_day, first_date, second_date):
+    """Рассчитывает количество дней до следующей зарплаты"""
+    today = datetime.now()
+    current_month = today.month
+    current_year = today.year
+
+    # Создаем даты зарплаты для текущего месяца
+    first_salary = datetime(current_year, current_month, first_date)
+    second_salary = datetime(current_year, current_month, second_date)
+
+    # Если обе даты зарплаты уже прошли в этом месяце, смотрим на следующий месяц
+    if today > second_salary:
+        if current_month == 12:
+            next_month = 1
+            next_year = current_year + 1
+        else:
+            next_month = current_month + 1
+            next_year = current_year
+
+        first_salary = datetime(next_year, next_month, first_date)
+        return (first_salary - today).days
+
+    # Если первая дата зарплаты прошла, но вторая - нет
+    if today > first_salary and today <= second_salary:
+        return (second_salary - today).days
+
+    # Если обе даты впереди, возвращаем дни до ближайшей
+    return (first_salary - today).days
+
+def get_safety_indicator(safety_index):
+    if safety_index >= 75:
+        return "🟢"
+    elif safety_index >= 50:
+        return "🟡"
+    elif safety_index >= 25:
+        return "🟠"
+    elif safety_index >= 0:
+        return "🔴"
+    else:
+        return "⛔️"
+
+def get_safety_description(safety_index):
+    if safety_index >= 75:
+        return "Отличный запас"
+    elif safety_index >= 50:
+        return "Хороший запас"
+    elif safety_index >= 25:
+        return "Умеренный риск"
+    elif safety_index >= 0:
+        return "Высокий риск"
+    else:
+        return "Критический риск"
+
+@bot.message_handler(func=lambda message: message.text.lower().startswith('прогноз'))
+def forecast_spending(message):
+    try:
+        amount = float(message.text.split()[1])
+        user_id = message.from_user.id
+
+        markup = types.InlineKeyboardMarkup(row_width=2)
+
+        conn = sqlite3.connect('finance.db')
+        c = conn.cursor()
+        c.execute('SELECT card_name FROM cards WHERE user_id = ?', (user_id,))
+        cards = c.fetchall()
+        conn.close()
+
+        buttons = []
+        for card in cards:
+            buttons.append(types.InlineKeyboardButton(
+                f"💳 {card[0]}",
+                callback_data=f"forecast_{amount}_{card[0]}"
+            ))
+
+        buttons.append(types.InlineKeyboardButton(
+            "💰 По всем картам",
+            callback_data=f"forecast_{amount}_all"
+        ))
+
+        markup.add(*buttons)
+
+        bot.reply_to(message, "Выберите карту для прогноза:", reply_markup=markup)
+
+    except (IndexError, ValueError):
+        bot.reply_to(message, "❌ Используйте формат: прогноз [сумма]")
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('forecast_'))
+def process_forecast_callback(call):
+    try:
+        _, amount, card_choice = call.data.split('_', 2)
+        amount = float(amount)
+        user_id = call.from_user.id
+
+        if card_choice == 'all':
+            conn = sqlite3.connect('finance.db')
+            c = conn.cursor()
+            c.execute('SELECT SUM(balance) FROM cards WHERE user_id = ?', (user_id,))
+            current_balance = c.fetchone()[0] or 0
+            card_name = "все карты"
+            conn.close()
+        else:
+            conn = sqlite3.connect('finance.db')
+            c = conn.cursor()
+            c.execute('SELECT balance FROM cards WHERE user_id = ? AND card_name = ?', (user_id, card_choice))
+            current_balance = c.fetchone()[0] or 0
+            card_name = card_choice
+            conn.close()
+
+        conn = sqlite3.connect('finance.db')
+        c = conn.cursor()
+        c.execute('SELECT first_date, second_date FROM salary_dates WHERE user_id = ?', (user_id,))
+        salary_dates = c.fetchone()
+        conn.close()
+
+        if not salary_dates:
+            bot.answer_callback_query(call.id, "❌ Сначала установите даты зарплаты командой /salary")
+            return
+
+        today = datetime.now().day
+        first_date, second_date = salary_dates
+        days_until_salary = calculate_days_until_salary(today, first_date, second_date)
+
+        _, avg_spending = get_stats_by_card(user_id, 30)
+        avg_daily_spending = avg_spending / 30 if avg_spending else 0
+
+        balance_after_purchase = current_balance - amount
+
+        if balance_after_purchase < 0:
+            response = "🔮 *Прогноз влияния траты:*\n\n"
+            response += f"💳 *Расчет для:* {card_name}\n"
+            response += f"💰 Текущий баланс: *{current_balance:,.2f}* ₽\n"
+            response += f"💳 Сумма покупки: *{amount:,.2f}* ₽\n"
+            response += f"⏳ Дней до зарплаты: *{days_until_salary}*\n\n"
+
+            response += "⛔️ *ВНИМАНИЕ:* Недостаточно средств!\n"
+            response += f"• Не хватает: *{abs(balance_after_purchase):,.2f}* ₽\n"
+            response += f"• Средний расход в день: *{avg_daily_spending:,.2f}* ₽\n\n"
+
+            if days_until_salary <= 1:
+                response += "💡 *Завтра зарплата!*\n\n"
+
+            response += "🎯 *Рекомендация:* Покупка невозможна - недостаточно средств\n"
+            response += f"🛡 *Статус:* ⛔️ Критический риск"
+
+            response += f"\n\n📊 *Прогноз доступных средств:*\n"
+            response += f"⛔️ Баланс будет отрицательным: *{balance_after_purchase:,.2f}* ₽"
+        else:
+            if days_until_salary <= 1:
+                daily_budget = current_balance
+                daily_budget_after = balance_after_purchase
+                potential_savings = balance_after_purchase - avg_daily_spending
+                risk_assessment = "✅ Покупка безопасна" if balance_after_purchase > avg_daily_spending * 2 else "⚠️ Учтите, что это последний день перед зарплатой"
+            else:
+                daily_budget = current_balance / days_until_salary
+                daily_budget_after = balance_after_purchase / days_until_salary
+                potential_savings = balance_after_purchase - (avg_daily_spending * days_until_salary)
+                risk_assessment = analyze_risk(daily_budget_after, avg_daily_spending)
+
+            safety_index = min(
+                ((balance_after_purchase - (avg_daily_spending * days_until_salary)) /
+                 (avg_daily_spending * days_until_salary)) * 100,
+                100
+            ) if avg_daily_spending > 0 and days_until_salary > 0 else 0
+
+            safety_indicator = get_safety_indicator(safety_index)
+
+            response = "🔮 *Прогноз влияния траты:*\n\n"
+            response += f"💳 *Расчет для:* {card_name}\n"
+            response += f"💰 Текущий баланс: *{current_balance:,.2f}* ₽\n"
+            response += f"💳 Сумма покупки: *{amount:,.2f}* ₽\n"
+            response += f"⏳ Дней до зарплаты: *{days_until_salary}*\n\n"
+
+            response += "📊 *Анализ бюджета:*\n"
+            if days_until_salary <= 1:
+                response += f"• Остаток после покупки: *{balance_after_purchase:,.2f}* ₽\n"
+                response += f"• Средний расход в день: *{avg_daily_spending:,.2f}* ₽\n"
+                response += f"\n💡 *Завтра зарплата!*\n"
+            else:
+                response += f"• Текущий дневной бюджет: *{daily_budget:,.2f}* ₽/день\n"
+                response += f"• Дневной бюджет после покупки: *{daily_budget_after:,.2f}* ₽/день\n"
+                response += f"• Средний расход в день: *{avg_daily_spending:,.2f}* ₽\n"
+
+            response += f"\n🎯 *Рекомендация:* {risk_assessment}\n"
+
+            if potential_savings > 0:
+                response += f"\n💰 *Потенциал накоплений до ЗП:* {potential_savings:,.2f}₽"
+
+            response += f"\n🛡 *Индекс безопасности:* {safety_indicator} {safety_index:.0f}% - {get_safety_description(safety_index)}"
+
+            response += "\n\n📊 *Прогноз доступных средств:*\n"
+            response += f"• {datetime.now().strftime('%d.%m')}: {balance_after_purchase:.2f} ₽"
+
+        bot.edit_message_text(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            text=response,
+            parse_mode='Markdown'
+        )
+
+    except Exception as e:
+        print(f"Error in forecast: {str(e)}")
+        traceback.print_exc()
+        bot.answer_callback_query(call.id, "Произошла ошибка при расчете прогноза")
+
+def analyze_risk(daily_budget, avg_daily_spending):
+    if daily_budget >= avg_daily_spending * 1.5:
+        return "✅ *Покупка безопасна*\nУ вас останется достаточный запас средств до зарплаты"
+    elif daily_budget >= avg_daily_spending * 1.2:
+        return "💚 *Покупка допустима*\nБюджет будет немного ограничен, но это некритично"
+    elif daily_budget >= avg_daily_spending:
+        return "⚠️ *Будьте осторожны*\nПридется более внимательно следить за тратами"
+    elif daily_budget >= avg_daily_spending * 0.7:
+        return "🔴 *Высокий риск*\nРекомендуется отложить покупку или найти дополнительный источник дохода"
+    else:
+        return "⛔️ *Критический риск*\nПокупка может привести к нехватке средств до зарплаты"
+
 def create_category_pie(user_id):
     plt.clf()
     plt.style.use('default')
@@ -1411,8 +1630,12 @@ def generate_daily_balance_forecast(total_balance, daily_budget, days_until_sala
 def format_forecast_message(forecast, daily_budget):
     message = "\n📊 *Прогноз доступных средств:*\n"
     for date, balance in forecast:
-        if balance > 0:
-            emoji = "✅" if balance > daily_budget * 2 else "⚠️"
+        if balance > daily_budget * 3:
+            emoji = "✅"
+        elif balance > daily_budget:
+            emoji = "💚"
+        elif balance > 0:
+            emoji = "⚠️"
         else:
             emoji = "🚫"
         message += f"• {date.strftime('%d.%m')}: {emoji} *{balance:.2f}* ₽\n"
