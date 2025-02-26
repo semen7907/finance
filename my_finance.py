@@ -23,7 +23,7 @@ import os
 
 
 # Инициализация бота
-bot = telebot.TeleBot('7212810100:AAEUpcoq36V_A3oadUDQmRx4cpASnR1qfjE')
+bot = telebot.TeleBot('TOKEN')
 
 
 # Инициализация БД
